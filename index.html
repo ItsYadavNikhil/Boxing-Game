@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Real-Time Hand Tracking Mirror</title>
+  
+  <!-- p5.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  
+  <!-- ml5.js (version 1 with handPose support) -->
+  <script src="https://unpkg.com/ml5@1/dist/ml5.min.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background-color: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+    
+    /* Mirror the entire canvas to act like a real mirror */
+    canvas {
+      transform: scaleX(-1);
+      width: 100vw !important;
+      height: 100vh !important;
+      object-fit: cover;
+    }
+    
+    /* Ensure raw video is completely hidden from the DOM */
+    video {
+      display: none !important;
+    }
+
+    #loading {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #00ff00;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 24px;
+      z-index: 10;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="loading">Loading HandPose Model...</div>
+
+  <script>
+    let handPose;
+    let video;
+    let hands = [];
+
+    // Game state variables
+    let currentState = 'IDLE';
+    let rightWristHistory = [];
+    let leftWristHistory = [];
+    let lastRightJabTime = 0;
+    let lastLeftJabTime = 0;
+    const JAB_COOLDOWN = 500;
+    let currentLeftSpeed = 0;
+    let currentRightSpeed = 0;
+
+    // The connections between joints for the hand skeleton
+    const connections = [
+      [0, 1], [1, 2], [2, 3], [3, 4],       // Thumb
+      [0, 5], [5, 6], [6, 7], [7, 8],       // Index Finger
+      [5, 9], [9, 10], [10, 11], [11, 12],  // Middle Finger
+      [9, 13], [13, 14], [14, 15], [15, 16],// Ring Finger
+      [13, 17], [17, 18], [18, 19], [19, 20],// Pinky
+      [0, 17]                               // Palm base connection
+    ];
+
+    function preload() {
+      // Load the handPose model
+      handPose = ml5.handPose();
+    }
+
+    function setup() {
+      // Create lower resolution canvas for performance
+      createCanvas(640, 480);
+      
+      // Setup webcam capture at the lower resolution
+      video = createCapture(VIDEO);
+      video.size(640, 480);
+      video.hide(); // Hide the HTML video element, we will draw it on canvas
+      
+      // Start detecting hands
+      handPose.detectStart(video, gotHands);
+    }
+
+    function draw() {
+      background(0);
+      
+      // Draw the video to the canvas (it will be mirrored by CSS)
+      image(video, 0, 0, width, height);
+
+      // Draw all tracked hands
+      for (let i = 0; i < hands.length; i++) {
+        let hand = hands[i];
+        let keypoints = hand.keypoints;
+
+        // Draw skeleton lines
+        stroke(0, 255, 0);
+        strokeWeight(3);
+        for (let j = 0; j < connections.length; j++) {
+          let pointAIndex = connections[j][0];
+          let pointBIndex = connections[j][1];
+
+          let pointA = keypoints[pointAIndex];
+          let pointB = keypoints[pointBIndex];
+
+          // Only draw if we have confident points (ml5 v1 keypoints have x and y)
+          if (pointA && pointB) {
+            line(pointA.x, pointA.y, pointB.x, pointB.y);
+          }
+        }
+
+        // Draw keypoint circles
+        noStroke();
+        fill(0, 255, 0);
+        for (let j = 0; j < keypoints.length; j++) {
+          let keypoint = keypoints[j];
+          circle(keypoint.x, keypoint.y, 10);
+        }
+      }
+
+      // --- GESTURE RECOGNITION LOGIC ---
+      let newState = 'IDLE';
+      let leftWristY = null;
+      let rightWristY = null;
+      let leftWristPos = null;
+      let rightWristPos = null;
+
+      for (let i = 0; i < hands.length; i++) {
+        let hand = hands[i];
+        let wrist = hand.keypoints[0]; // 0 is wrist
+        if (wrist) {
+          if (hand.handedness === 'Left') {
+            leftWristY = wrist.y;
+            leftWristPos = { x: wrist.x, y: wrist.y };
+          } else if (hand.handedness === 'Right') {
+            rightWristY = wrist.y;
+            rightWristPos = { x: wrist.x, y: wrist.y };
+          } else {
+            // Fallback if handedness isn't properly detected
+            if (rightWristPos === null) {
+              rightWristY = wrist.y;
+              rightWristPos = { x: wrist.x, y: wrist.y };
+            } else if (leftWristPos === null) {
+              leftWristY = wrist.y;
+              leftWristPos = { x: wrist.x, y: wrist.y };
+            }
+          }
+        }
+      }
+
+      let currentTime = millis();
+
+      // Block Logic
+      if (leftWristY !== null && rightWristY !== null) {
+        if (leftWristY < height / 2 && rightWristY < height / 2) {
+          newState = 'BLOCKING';
+        }
+      }
+
+      // Jab Logic (Velocity Tracking) - RIGHT
+      if (rightWristPos) {
+        rightWristHistory.push(rightWristPos);
+        if (rightWristHistory.length > 5) {
+          rightWristHistory.shift();
+        }
+
+        if (rightWristHistory.length === 5) {
+          let oldest = rightWristHistory[0];
+          let newest = rightWristHistory[4];
+          let distance = dist(oldest.x, oldest.y, newest.x, newest.y);
+          currentRightSpeed = distance.toFixed(1);
+
+          if (distance > 25) {
+            if (currentTime - lastRightJabTime > JAB_COOLDOWN) {
+              newState = 'RIGHT JAB';
+              lastRightJabTime = currentTime;
+            }
+          }
+        }
+      } else {
+        rightWristHistory = [];
+        currentRightSpeed = 0;
+      }
+
+      // Jab Logic (Velocity Tracking) - LEFT
+      if (leftWristPos) {
+        leftWristHistory.push(leftWristPos);
+        if (leftWristHistory.length > 5) {
+          leftWristHistory.shift();
+        }
+
+        if (leftWristHistory.length === 5) {
+          let oldest = leftWristHistory[0];
+          let newest = leftWristHistory[4];
+          let distance = dist(oldest.x, oldest.y, newest.x, newest.y);
+          currentLeftSpeed = distance.toFixed(1);
+
+          if (distance > 25) {
+            if (currentTime - lastLeftJabTime > JAB_COOLDOWN) {
+              newState = 'LEFT JAB';
+              lastLeftJabTime = currentTime;
+            }
+          }
+        }
+      } else {
+        leftWristHistory = [];
+        currentLeftSpeed = 0;
+      }
+
+      // Cooldown UI override (keep 'JAB' on screen briefly)
+      if (currentTime - lastRightJabTime < 300) {
+        newState = 'RIGHT JAB';
+      } else if (currentTime - lastLeftJabTime < 300) {
+        newState = 'LEFT JAB';
+      }
+
+      currentState = newState;
+
+      // Draw HUD
+      push();
+      // Reverse the CSS mirror so text is readable
+      translate(width, 0);
+      scale(-1, 1);
+      
+      // HUD Background Box
+      fill(0, 0, 0, 150);
+      noStroke();
+      rect(10, 10, 340, 140);
+
+      // HUD Text
+      fill(255, 255, 0); // Bright Yellow
+      stroke(0);         // Black outline
+      strokeWeight(3);
+      textSize(24);
+      textStyle(BOLD);
+      textAlign(LEFT, TOP);
+      
+      text("Current State: " + currentState, 20, 20);
+      text("Left Hand Speed: " + currentLeftSpeed, 20, 60);
+      text("Right Hand Speed: " + currentRightSpeed, 20, 100);
+      pop();
+    }
+
+    // Callback when hands are detected
+    function gotHands(results) {
+      hands = results;
+      
+      // Hide loading text once model is ready and running
+      let loadingDiv = document.getElementById('loading');
+      if (loadingDiv) {
+        loadingDiv.style.display = 'none';
+      }
+    }
+
+    // Handle window resizing (no longer needed to resize canvas logic since CSS handles scaling)
+    function windowResized() {
+      // Intentionally left empty. The canvas and video stay 640x480.
+      // CSS width/height 100vw/100vh stretches it to fill the screen.
+    }
+  </script>
+</body>
+</html>

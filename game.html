@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Boxing Game Engine</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #111;
+            font-family: sans-serif;
+        }
+
+        canvas {
+            background-color: #222;
+            /* Dark background */
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.8);
+            border: 2px solid #444;
+        }
+
+        #ui-container {
+            position: absolute;
+            top: 20px;
+            width: 100%;
+            text-align: center;
+            color: white;
+            pointer-events: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="ui-container">
+        <h2>2D Boxing Engine</h2>
+        <p>Hold 'Shift' to Block | Press 'A' for Left Punch | Press 'D' for Right Punch</p>
+    </div>
+
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false;
+        const spriteScale = 0.3;
+
+        const leftRope = 50;
+        const rightRope = canvas.width - 50;
+
+        let isGameOver = false;
+        let DEBUG_MODE = false;
+
+        // --- Assets & Loading ---
+        const bgImage = new Image();
+        bgImage.src = 'assets/bg.png';
+        const playerSprite = new Image();
+        playerSprite.src = 'assets/player_sprite.png';
+        const enemySprite = new Image();
+        enemySprite.src = 'assets/enemy_sprite.png';
+
+        let imagesLoaded = 0;
+        const totalImages = 3;
+        
+        const sndOpeningBell = new Audio('Sfx/Openingbell.wav');
+        const sndBgNoise = new Audio('Sfx/bgnoise.wav');
+        const sndMiss = new Audio('Sfx/miss.wav');
+        const sndBlocked = new Audio('Sfx/blocked.wav');
+        const sndPunch = new Audio('Sfx/punch.wav');
+        const sndFall = new Audio('Sfx/fall.wav');
+
+        function playSound(audioVar) {
+            audioVar.cloneNode(true).play().catch(e => console.log('Audio error:', e));
+        }
+
+        let isGameStarted = false;
+
+        function checkStart() {
+            imagesLoaded++;
+            if (imagesLoaded === totalImages) {
+                console.log("Images Loaded Successfully");
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = 'white';
+                ctx.font = 'bold 30px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText('CLICK ANYWHERE TO RING THE BELL', canvas.width / 2, canvas.height / 2);
+            }
+        }
+
+        canvas.addEventListener('click', () => {
+            if (imagesLoaded >= totalImages && !isGameStarted) {
+                isGameStarted = true;
+                playSound(sndOpeningBell);
+                sndBgNoise.volume = 0.3;
+                sndBgNoise.loop = true;
+                sndBgNoise.play().catch(e => console.log('Bg noise error:', e));
+                requestAnimationFrame(gameLoop);
+            }
+        });
+
+        bgImage.onload = checkStart;
+        playerSprite.onload = checkStart;
+        enemySprite.onload = checkStart;
+
+        // If an image fails, start anyway so it doesn't freeze
+        bgImage.onerror = checkStart;
+        playerSprite.onerror = checkStart;
+        enemySprite.onerror = checkStart;
+
+        // --- Sprite Configuration ---
+        const spriteRows = {
+            'IDLE': 0,
+            'PUNCH_LEFT': 9,
+            'PUNCH_RIGHT': 9,
+            'PUNCHING': 10,
+            'BLOCKING': 1,
+            'HURT': 8,
+            'DODGING': 5
+        };
+
+        // --- Entities ---
+        const player = {
+            x: 250,
+            y: 300,
+            width: 60,
+            height: 150,
+            hitboxWidth: 100,
+            hitboxHeight: 120,
+            hitboxOffsetX: 85,
+            hitboxOffsetY: 40,
+            punchReach: 15,
+            state: 'IDLE', // IDLE, BLOCKING, PUNCH_LEFT, PUNCH_RIGHT, HURT
+            cooldownEnd: 0,
+            punchEnd: 0,
+            activePunch: null, // 'LEFT' or 'RIGHT' or null
+            hasHit: false, // Tracks if the current punch has already dealt damage
+            maxHealth: 100,
+            health: 100,
+            flashEndTime: 0,
+            knockbackTargetX: 250,
+            // Animation tracking
+            frameX: 0,
+            frameY: 0,
+            frameTimer: 0,
+            frameInterval: 8 // Ticks per frame
+        };
+
+        const enemy = {
+            x: 500,
+            y: 300,
+            width: 60,
+            height: 150,
+            hitboxWidth: 100,
+            hitboxHeight: 120,
+            hitboxOffsetX: 45,
+            hitboxOffsetY: 40,
+            punchReach: 15,
+            state: 'IDLE', // IDLE, PUNCHING, BLOCKING, DODGING, HURT
+            maxHealth: 100,
+            health: 100,
+            nextActionTime: 2000,
+            punchEnd: 0,
+            blockEnd: 0,
+            activePunch: false,
+            hasHit: false,
+            flashEndTime: 0,
+            knockbackTargetX: 500,
+            // Animation tracking
+            frameX: 0,
+            frameY: 0,
+            frameTimer: 0,
+            frameInterval: 8
+        };
+
+        function updateAnimation(entity) {
+            let animState = entity.state;
+            if (spriteRows[animState] === undefined) {
+                animState = 'IDLE'; // Fallback
+            }
+
+            const targetRow = spriteRows[animState];
+
+            // If state changed, reset animation frame
+            if (entity.frameY !== targetRow) {
+                entity.frameY = targetRow;
+                entity.frameX = 0;
+                entity.frameTimer = 0;
+            }
+
+            // Advance frame based on timer
+            entity.frameTimer++;
+            if (entity.frameTimer >= entity.frameInterval) {
+                entity.frameTimer = 0;
+                entity.frameX = (entity.frameX + 1) % 10; // Max columns is 10
+            }
+        }
+
+        // --- Input State ---
+        const keys = {
+            Shift: false,
+            A: false,
+            D: false,
+            ArrowLeft: false,
+            ArrowRight: false
+        };
+
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Shift') keys.Shift = true;
+            if (e.key.toLowerCase() === 'a') keys.A = true;
+            if (e.key.toLowerCase() === 'd') keys.D = true;
+            if (e.key === 'ArrowLeft') keys.ArrowLeft = true;
+            if (e.key === 'ArrowRight') keys.ArrowRight = true;
+
+            if (e.key === '0') DEBUG_MODE = !DEBUG_MODE;
+
+            if (e.key.toLowerCase() === 'r' && isGameOver) {
+                resetGame();
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.key === 'Shift') keys.Shift = false;
+            if (e.key.toLowerCase() === 'a') keys.A = false;
+            if (e.key.toLowerCase() === 'd') keys.D = false;
+            if (e.key === 'ArrowLeft') keys.ArrowLeft = false;
+            if (e.key === 'ArrowRight') keys.ArrowRight = false;
+        });
+
+        function resetGame() {
+            player.health = 100;
+            enemy.health = 100;
+            player.x = 250;
+            player.knockbackTargetX = 250;
+            enemy.x = 500;
+            enemy.knockbackTargetX = 500;
+            player.state = 'IDLE';
+            enemy.state = 'IDLE';
+            player.activePunch = null;
+            enemy.activePunch = false;
+            isGameOver = false;
+        }
+
+        // --- Collision Logic ---
+        function hitTestRectangle(r1, r2) {
+            const h1x = r1.x + (r1.hitboxOffsetX || 0);
+            const h1y = r1.y + (r1.hitboxOffsetY || 0);
+            const h1w = r1.hitboxWidth || r1.width;
+            const h1h = r1.hitboxHeight || r1.height;
+
+            const h2x = r2.x + (r2.hitboxOffsetX || 0);
+            const h2y = r2.y + (r2.hitboxOffsetY || 0);
+            const h2w = r2.hitboxWidth || r2.width;
+            const h2h = r2.hitboxHeight || r2.height;
+
+            return h1x < h2x + h2w &&
+                h1x + h1w > h2x &&
+                h1y < h2y + h2h &&
+                h1y + h1h > h2y;
+        }
+
+        function getPunchHitbox() {
+            if (!player.activePunch) return null;
+
+            let hitboxWidth = player.punchReach || 80;
+            let hitboxHeight = 30;
+            let yOffset = player.activePunch === 'LEFT' ? 30 : 70; // Different vertical positions
+
+            return {
+                x: player.x + (player.hitboxOffsetX || 0) + (player.hitboxWidth || player.width),
+                y: player.y + (player.hitboxOffsetY || 0) + yOffset,
+                width: hitboxWidth,
+                height: hitboxHeight
+            };
+        }
+
+        function getEnemyPunchHitbox() {
+            if (!enemy.activePunch) return null;
+            let hitboxWidth = enemy.punchReach || 80;
+            let hitboxHeight = 30;
+            let yOffset = 50; // Middle height
+            return {
+                x: enemy.x + (enemy.hitboxOffsetX || 0) - hitboxWidth,
+                y: enemy.y + (enemy.hitboxOffsetY || 0) + yOffset,
+                width: hitboxWidth,
+                height: hitboxHeight
+            };
+        }
+
+        // --- Main Update Logic ---
+        function update(time) {
+            // Check for death
+            if ((player.health <= 0 || enemy.health <= 0) && !isGameOver) {
+                isGameOver = true;
+                playSound(sndFall);
+                setTimeout(() => {
+                    playSound(sndOpeningBell);
+                }, 500);
+                sndBgNoise.volume = 0.8;
+            }
+
+            if (isGameOver) {
+                return; // Freeze game logic
+            }
+
+            // Player Movement Logic (Manual walk)
+            if (player.state !== 'HURT' && player.state !== 'PUNCH_LEFT' && player.state !== 'PUNCH_RIGHT' && player.state !== 'BLOCKING') {
+                let moveSpeed = 3;
+                if (keys.ArrowLeft) {
+                    player.x -= moveSpeed;
+                    player.knockbackTargetX = player.x;
+                }
+                if (keys.ArrowRight) {
+                    player.x += moveSpeed;
+                    player.knockbackTargetX = player.x;
+                }
+            }
+
+            // Interpolate knockback
+            player.x += (player.knockbackTargetX - player.x) * 0.1;
+            enemy.x += (enemy.knockbackTargetX - enemy.x) * 0.1;
+
+            // Boundary Checks (Pre-AI logic clamp)
+            let minPlayerX = leftRope - player.hitboxOffsetX;
+            let maxPlayerX = rightRope - player.hitboxOffsetX - player.hitboxWidth;
+            player.x = Math.max(minPlayerX, Math.min(player.x, maxPlayerX));
+            player.knockbackTargetX = Math.max(minPlayerX, Math.min(player.knockbackTargetX, maxPlayerX));
+
+            let minEnemyX = player.x + player.hitboxOffsetX + player.hitboxWidth - enemy.hitboxOffsetX;
+            let maxEnemyX = rightRope - enemy.hitboxOffsetX - enemy.hitboxWidth;
+
+            enemy.x = Math.min(maxEnemyX, Math.max(minEnemyX, enemy.x));
+            enemy.knockbackTargetX = Math.min(maxEnemyX, Math.max(minEnemyX, enemy.knockbackTargetX));
+
+            let maxPlayerXByEnemy = enemy.x + enemy.hitboxOffsetX - player.hitboxWidth - player.hitboxOffsetX;
+            player.x = Math.min(player.x, maxPlayerXByEnemy);
+            player.knockbackTargetX = Math.min(player.knockbackTargetX, maxPlayerXByEnemy);
+
+            // Player State Management
+            if (player.state === 'HURT') {
+                if (time > player.cooldownEnd) {
+                    player.state = 'IDLE';
+                }
+            } else {
+                // Release punch state back to IDLE when cooldown is over
+                if (time > player.cooldownEnd && (player.state === 'PUNCH_LEFT' || player.state === 'PUNCH_RIGHT')) {
+                    player.state = 'IDLE';
+                }
+
+                // Stop drawing the punch visual after 200ms
+                if (time > player.punchEnd) {
+                    player.activePunch = null;
+                }
+
+                // Check inputs only if we are past the 400ms cooldown
+                if (time > player.cooldownEnd) {
+                    if (keys.A && !keys.Shift) {
+                        player.state = 'PUNCH_LEFT';
+                        player.activePunch = 'LEFT';
+                        player.punchEnd = time + 200;
+                        player.cooldownEnd = time + 400;
+                        player.hasHit = false;
+                        playSound(sndMiss);
+                    } else if (keys.D && !keys.Shift) {
+                        player.state = 'PUNCH_RIGHT';
+                        player.activePunch = 'RIGHT';
+                        player.punchEnd = time + 200;
+                        player.cooldownEnd = time + 400;
+                        player.hasHit = false;
+                        playSound(sndMiss);
+                    } else if (keys.Shift) {
+                        player.state = 'BLOCKING';
+                    } else {
+                        player.state = 'IDLE';
+                    }
+                }
+            }
+
+            // Check hits during Player's active punch window
+            if (player.activePunch && !player.hasHit) {
+                const hitbox = getPunchHitbox();
+                if (hitbox && hitTestRectangle(hitbox, enemy)) {
+                    if (enemy.state === 'BLOCKING') {
+                        // Enemy blocked it!
+                        player.hasHit = true;
+                        playSound(sndBlocked);
+                    } else {
+                        enemy.health -= 10;
+                        if (enemy.health < 0) enemy.health = 0;
+
+                        enemy.state = 'HURT';
+                        enemy.flashEndTime = time + 300;
+                        enemy.knockbackTargetX = enemy.x + 30; // Knockback to the right
+
+                        player.hasHit = true;
+                        playSound(sndPunch);
+                    }
+                }
+            }
+
+            // Enemy AI Management (The Hunter)
+            if (enemy.state === 'HURT') {
+                if (time > enemy.flashEndTime) {
+                    enemy.state = 'IDLE';
+                }
+            } else if (enemy.state === 'BLOCKING') {
+                if (time > enemy.blockEnd) {
+                    enemy.state = 'IDLE';
+                }
+            } else if (enemy.state === 'DODGING') {
+                if (time > enemy.nextActionTime) {
+                    enemy.state = 'IDLE';
+                }
+            } else {
+                // Stop drawing enemy punch visual after 200ms
+                if (time > enemy.punchEnd) {
+                    enemy.activePunch = false;
+                    if (enemy.state === 'PUNCHING') enemy.state = 'IDLE';
+                }
+
+                if (enemy.state === 'IDLE') {
+                    let playerCenterX = player.x + player.hitboxOffsetX + player.hitboxWidth / 2;
+                    let enemyCenterX = enemy.x + enemy.hitboxOffsetX + enemy.hitboxWidth / 2;
+
+                    let distance = enemyCenterX - playerCenterX;
+                    let hitboxGap = distance - (enemy.hitboxWidth / 2 + player.hitboxWidth / 2);
+
+                    if (hitboxGap > enemy.punchReach) {
+                        // Walk towards player
+                        enemy.knockbackTargetX -= 2; // 2 pixels per frame
+                        enemy.x -= 2;
+                    } else {
+                        // Within striking distance
+                        if (time > enemy.nextActionTime) {
+                            let randomAction = Math.random();
+
+                            if (randomAction < 0.6) {
+                                // 60% Punch
+                                enemy.state = 'PUNCHING';
+                                enemy.activePunch = true;
+                                enemy.punchEnd = time + 200;
+                                enemy.hasHit = false;
+                                enemy.nextActionTime = time + 1500 + Math.random() * 1000;
+                                playSound(sndMiss);
+                            } else if (randomAction < 0.9) {
+                                // 30% Block
+                                enemy.state = 'BLOCKING';
+                                enemy.blockEnd = time + 1000;
+                                enemy.nextActionTime = time + 1200;
+                            } else {
+                                // 10% Dodge
+                                enemy.state = 'DODGING';
+                                enemy.knockbackTargetX += 50; // Short step back
+                                enemy.nextActionTime = time + 200; // Short duration
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check hits during Enemy's active punch window
+            if (enemy.activePunch && !enemy.hasHit) {
+                const enemyHitbox = getEnemyPunchHitbox();
+                if (enemyHitbox && hitTestRectangle(enemyHitbox, player)) {
+                    if (player.state === 'BLOCKING') {
+                        // Blocked!
+                        enemy.hasHit = true;
+                        playSound(sndBlocked);
+                    } else {
+                        // Hit!
+                        player.health -= 10;
+                        if (player.health < 0) player.health = 0;
+
+                        player.state = 'HURT';
+                        player.cooldownEnd = time + 300;
+                        player.flashEndTime = time + 300;
+                        player.knockbackTargetX = player.x - 30; // Knockback to the left
+                        player.activePunch = null; // Cancel any active player punch
+
+                        enemy.hasHit = true;
+                        playSound(sndPunch);
+                    }
+                }
+            }
+
+            // Final Boundary clamp after AI logic
+            let finalMinPlayerX = leftRope - player.hitboxOffsetX;
+            let finalMaxPlayerX = rightRope - player.hitboxOffsetX - player.hitboxWidth;
+            player.x = Math.max(finalMinPlayerX, Math.min(player.x, finalMaxPlayerX));
+            player.knockbackTargetX = Math.max(finalMinPlayerX, Math.min(player.knockbackTargetX, finalMaxPlayerX));
+
+            let finalMinEnemyX = player.x + player.hitboxOffsetX + player.hitboxWidth - enemy.hitboxOffsetX;
+            let finalMaxEnemyX = rightRope - enemy.hitboxOffsetX - enemy.hitboxWidth;
+
+            enemy.x = Math.min(finalMaxEnemyX, Math.max(finalMinEnemyX, enemy.x));
+            enemy.knockbackTargetX = Math.min(finalMaxEnemyX, Math.max(finalMinEnemyX, enemy.knockbackTargetX));
+
+            let finalMaxPlayerXByEnemy = enemy.x + enemy.hitboxOffsetX - player.hitboxWidth - player.hitboxOffsetX;
+            player.x = Math.min(player.x, finalMaxPlayerXByEnemy);
+            player.knockbackTargetX = Math.min(player.knockbackTargetX, finalMaxPlayerXByEnemy);
+
+            // Update animations
+            updateAnimation(player);
+            updateAnimation(enemy);
+        }
+
+        // --- Rendering Logic ---
+        function draw(time) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 1. Draw Arena Background
+            if (bgImage.complete && bgImage.naturalWidth > 0) {
+                ctx.drawImage(bgImage, 0, 0, canvas.width, canvas.height);
+            } else {
+                // Fallback
+                ctx.fillStyle = '#666';
+                ctx.fillRect(0, 450, canvas.width, 150);
+            }
+
+            // Helper to draw sprites with hit flash support
+            function drawSprite(entity, spriteImg) {
+                if (spriteImg.complete && spriteImg.naturalWidth > 0) {
+                    const spriteWidth = spriteImg.width / 10;
+                    const spriteHeight = spriteImg.height / 10;
+
+                    entity.width = spriteWidth * spriteScale;
+                    entity.height = spriteHeight * spriteScale;
+
+                    const sourceX = entity.frameX * spriteWidth;
+                    const sourceY = entity.frameY * spriteHeight;
+
+                    let renderX = entity.x;
+                    let renderY = entity.y;
+
+                    const isPlayer = (entity === player);
+
+                    if (isPlayer) {
+                        ctx.save();
+                        ctx.scale(-1, 1);
+                        renderX = -entity.x - entity.width;
+                    }
+
+                    if (time < entity.flashEndTime) {
+                        // Flash effect: draw sprite normally, then draw white rect over it using source-atop
+                        const offCanvas = document.createElement('canvas');
+                        offCanvas.width = entity.width;
+                        offCanvas.height = entity.height;
+                        const offCtx = offCanvas.getContext('2d');
+                        offCtx.imageSmoothingEnabled = false;
+
+                        // Draw sprite to offscreen canvas
+                        offCtx.drawImage(
+                            spriteImg,
+                            sourceX, sourceY,
+                            spriteWidth, spriteHeight,
+                            0, 0, entity.width, entity.height
+                        );
+
+                        // Draw white over it
+                        offCtx.globalCompositeOperation = 'source-in';
+                        offCtx.fillStyle = '#FFFFFF';
+                        offCtx.fillRect(0, 0, entity.width, entity.height);
+
+                        // Draw offscreen canvas to main canvas
+                        ctx.drawImage(offCanvas, renderX, renderY);
+                    } else {
+                        // Normal sprite draw
+                        ctx.drawImage(
+                            spriteImg,
+                            sourceX, sourceY,
+                            spriteWidth, spriteHeight,
+                            renderX, renderY, entity.width, entity.height
+                        );
+                    }
+
+                    if (isPlayer) {
+                        ctx.restore();
+                    }
+                } else {
+                    // Fallback colored rect
+                    ctx.fillStyle = time < entity.flashEndTime ? '#FFFFFF' : (entity === player ? 'blue' : 'red');
+                    ctx.fillRect(entity.x, entity.y, entity.width, entity.height);
+                }
+            }
+
+            // 2. Draw Player
+            drawSprite(player, playerSprite);
+
+            // 3. Draw Enemy
+            drawSprite(enemy, enemySprite);
+
+            // 4. Draw Mathematical Hitboxes (X-Ray Debug Mode)
+            if (DEBUG_MODE) {
+                // Body Hitboxes
+                ctx.fillStyle = 'rgba(0, 255, 0, 0.4)';
+                ctx.fillRect(player.x + player.hitboxOffsetX, player.y + player.hitboxOffsetY, player.hitboxWidth, player.hitboxHeight);
+                ctx.fillRect(enemy.x + enemy.hitboxOffsetX, enemy.y + enemy.hitboxOffsetY, enemy.hitboxWidth, enemy.hitboxHeight);
+
+                // Punch Hitboxes
+                ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+                const hitbox = getPunchHitbox();
+                if (hitbox && player.activePunch) {
+                    ctx.fillRect(hitbox.x, hitbox.y, hitbox.width, hitbox.height);
+                }
+
+                const enemyHitbox = getEnemyPunchHitbox();
+                if (enemyHitbox && enemy.activePunch) {
+                    ctx.fillRect(enemyHitbox.x, enemyHitbox.y, enemyHitbox.width, enemyHitbox.height);
+                }
+            }
+
+            // 5. Draw Health Bars UI
+            const barWidth = 300;
+            const barHeight = 25;
+            const barY = 60;
+
+            // Enemy Health (Right)
+            const enemyBarX = canvas.width - barWidth - 40;
+            ctx.fillStyle = 'red';
+            ctx.fillRect(enemyBarX, barY, barWidth, barHeight);
+            const enemyHealthWidth = (enemy.health / enemy.maxHealth) * barWidth;
+            ctx.fillStyle = '#00ff00';
+            ctx.fillRect(enemyBarX, barY, enemyHealthWidth, barHeight);
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(enemyBarX, barY, barWidth, barHeight);
+            ctx.fillStyle = 'white';
+            ctx.font = 'bold 16px Arial';
+            ctx.textAlign = 'right';
+            ctx.fillText(`ENEMY HEALTH: ${enemy.health}`, canvas.width - 40, barY - 10);
+
+            // Player Health (Left)
+            const playerBarX = 40;
+            ctx.fillStyle = 'red';
+            ctx.fillRect(playerBarX, barY, barWidth, barHeight);
+            const playerHealthWidth = (player.health / player.maxHealth) * barWidth;
+            ctx.fillStyle = '#00ff00';
+            ctx.fillRect(playerBarX, barY, playerHealthWidth, barHeight);
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(playerBarX, barY, barWidth, barHeight);
+            ctx.fillStyle = 'white';
+            ctx.textAlign = 'left';
+            ctx.fillText(`PLAYER HEALTH: ${player.health}`, 40, barY - 10);
+
+            // State Debug Text
+            ctx.fillStyle = 'white';
+            ctx.font = '20px Arial';
+            ctx.textAlign = 'left';
+            ctx.fillText(`Player State: ${player.state}`, 20, 120);
+
+            // Controls helper text inside canvas
+            ctx.font = '14px Arial';
+            ctx.fillStyle = '#aaa';
+            ctx.fillText(`Left/Right Arrows = MOVE`, 20, 150);
+            ctx.fillText(`Shift = BLOCKING`, 20, 170);
+            ctx.fillText(`A = PUNCH_LEFT`, 20, 190);
+            ctx.fillText(`D = PUNCH_RIGHT`, 20, 210);
+
+            // --- Game Over Screen ---
+            if (isGameOver) {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                ctx.textAlign = 'center';
+
+                // Massive K.O!
+                ctx.fillStyle = 'yellow';
+                ctx.font = 'bold 120px Arial';
+                ctx.fillText('K.O!', canvas.width / 2, canvas.height / 2 - 20);
+
+                // Win/Loss text
+                ctx.font = 'bold 60px Arial';
+                if (enemy.health <= 0) {
+                    ctx.fillStyle = '#00ff00'; // Green
+                    ctx.fillText('YOU WIN', canvas.width / 2, canvas.height / 2 + 60);
+                } else if (player.health <= 0) {
+                    ctx.fillStyle = 'red'; // Red
+                    ctx.fillText('YOU LOSE', canvas.width / 2, canvas.height / 2 + 60);
+                }
+
+                // Restart text
+                ctx.fillStyle = 'white';
+                ctx.font = '30px Arial';
+                ctx.fillText('Press R to Restart', canvas.width / 2, canvas.height / 2 + 130);
+            }
+        }
+
+        // --- Game Loop ---
+        function gameLoop(time) {
+            update(time);
+            draw(time);
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Start loop starts after images load (see checkStart function)
+        // Display loading text initially
+        ctx.fillStyle = 'white';
+        ctx.font = '24px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('LOADING ASSETS...', canvas.width / 2, canvas.height / 2);
+    </script>
+</body>
+
+</html>
